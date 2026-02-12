@@ -1,0 +1,24 @@
+{
+  "over-sharded": {
+    "description": "Index has 10 primary shards for only ~500 documents. Each shard holds ~50 docs, well below the recommended minimum of 10-50GB per shard.",
+    "index": "sb-{id}-over-sharded-metrics",
+    "problems": [
+      {
+        "issue": "Excessive shard count",
+        "evidence": "10 primary shards for ~500 documents (~50 docs per shard)",
+        "impact": "Each shard has fixed memory overhead (~10MB). 10 shards waste ~90MB of overhead for data that fits in one shard. Search must fan out to all 10 shards adding latency. Cluster state bloat.",
+        "threshold": "Recommended: 10-50GB per shard. This index is ~50KB total."
+      }
+    ],
+    "fix": {
+      "approach": "Shrink to 1 primary shard",
+      "steps": [
+        "1. Block writes: PUT /sb-{id}-over-sharded-metrics/_settings {\"index.blocks.write\": true}",
+        "2. Shrink: POST /sb-{id}-over-sharded-metrics/_shrink/sb-{id}-over-sharded-metrics-shrunk {\"settings\": {\"index.number_of_shards\": 1, \"index.blocks.write\": null}}",
+        "3. Verify: GET /_cat/shards/sb-{id}-over-sharded-metrics-shrunk",
+        "4. Alias swap if needed"
+      ],
+      "alternative": "Reindex into a new 1-shard index if shrink prerequisites aren't met"
+    }
+  }
+}

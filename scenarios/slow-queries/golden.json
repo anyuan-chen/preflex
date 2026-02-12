@@ -1,0 +1,38 @@
+{
+  "slow-queries": {
+    "description": "Slow log thresholds are set unreasonably low (1ms warn, 0ms info) and several query patterns are inherently expensive",
+    "indices": ["sb-{id}-slow-query-logs", "sb-{id}-slow-query-samples"],
+    "problems": [
+      {
+        "issue": "Unreasonably low slow log thresholds",
+        "evidence": "index.search.slowlog.threshold.query.warn=1ms, info=0ms",
+        "impact": "Every single query logs as slow. Fills up logs, obscures real performance issues, adds I/O overhead.",
+        "fix": "Raise thresholds: warn=1s, info=200ms (or disable info-level slow log entirely)"
+      },
+      {
+        "issue": "Leading wildcard queries",
+        "evidence": "Query pattern: {\"wildcard\":{\"message\":{\"value\":\"*timeout*\"}}}",
+        "impact": "Leading wildcards cannot use the inverted index. Forces a full scan of every term in the field. O(n) where n = unique terms.",
+        "fix": "Use match query with appropriate analyzer, or use ngram tokenizer if substring search is required. If wildcard is necessary, avoid leading *."
+      },
+      {
+        "issue": "Script score on all documents",
+        "evidence": "script_score with match_all and Math.log computation",
+        "impact": "Executes script on every document in the index. No index optimization possible. CPU-bound O(n).",
+        "fix": "Pre-compute the score at index time into a dedicated field. Or use function_score with field_value_factor instead of custom script."
+      },
+      {
+        "issue": "Deep pagination",
+        "evidence": "from=10000, size=10",
+        "impact": "ES must fetch and score 10,010 documents across all shards, discard 10,000. Memory and CPU waste scales linearly with 'from'.",
+        "fix": "Use search_after for deep pagination, or point-in-time API. Avoid from > 10000 (default max_result_window)."
+      },
+      {
+        "issue": "Unbounded high-cardinality aggregation",
+        "evidence": "terms aggregation on trace_id with size=100000",
+        "impact": "trace_id is high cardinality (unique per request). Aggregating 100k buckets requires large amounts of memory. Response payload is massive.",
+        "fix": "Reduce size to a reasonable limit (10-100). Use composite aggregation for paginated access to all buckets. Consider if this aggregation is actually needed."
+      }
+    ]
+  }
+}

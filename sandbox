@@ -1,0 +1,568 @@
+#!/usr/bin/env bash
+# sandbox — CLI entry point for Elasticsearch sandbox management
+#
+# Usage:
+#   ./sandbox create [--scenarios=bad-mapping,over-sharded] [--id=custom-id]
+#   ./sandbox destroy <id>
+#   ./sandbox destroy --all
+#   ./sandbox list
+#   ./sandbox reset <id>
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Source all libraries
+source "${SCRIPT_DIR}/lib/common.sh"
+source "${SCRIPT_DIR}/lib/docker.sh"
+source "${SCRIPT_DIR}/lib/manifest.sh"
+source "${SCRIPT_DIR}/lib/es.sh"
+source "${SCRIPT_DIR}/lib/agent_builder.sh"
+source "${SCRIPT_DIR}/lib/mcp.sh"
+source "${SCRIPT_DIR}/lib/workload.sh"
+source "${SCRIPT_DIR}/lib/eval.sh"
+source "${SCRIPT_DIR}/lib/sim.sh"
+
+# Load config
+load_config
+
+# All available scenarios
+ALL_SCENARIOS=("bad-mapping" "over-sharded" "slow-queries" "bad-replicas")
+
+# All available evals (realtime simulations)
+ALL_EVALS=("bad-mapping" "over-sharded" "slow-queries" "bad-replicas" "mixed-degradation")
+
+# ── Scenario dispatch ───────────────────────────────────────────────────────
+
+run_scenario_setup() {
+  local scenario="$1" port="$2" id="$3"
+  local setup_script="${SCRIPT_DIR}/scenarios/${scenario}/setup.sh"
+  [[ -f "$setup_script" ]] || die "Setup script not found: $setup_script"
+  source "$setup_script"
+
+  case "$scenario" in
+    bad-mapping)    setup_bad_mapping "$port" "$id" ;;
+    over-sharded)   setup_over_sharded "$port" "$id" ;;
+    slow-queries)   setup_slow_queries "$port" "$id" ;;
+    bad-replicas)   setup_bad_replicas "$port" "$id" ;;
+    *)              die "Unknown scenario: $scenario" ;;
+  esac
+}
+
+run_scenario_data() {
+  local scenario="$1" port="$2" id="$3"
+  local data_script="${SCRIPT_DIR}/scenarios/${scenario}/data.sh"
+  [[ -f "$data_script" ]] || die "Data script not found: $data_script"
+  source "$data_script"
+
+  case "$scenario" in
+    bad-mapping)    load_bad_mapping_data "$port" "$id" ;;
+    over-sharded)   load_over_sharded_data "$port" "$id" ;;
+    slow-queries)   load_slow_queries_data "$port" "$id" ;;
+    bad-replicas)   load_bad_replicas_data "$port" "$id" ;;
+    *)              die "Unknown scenario: $scenario" ;;
+  esac
+}
+
+# ── Commands ────────────────────────────────────────────────────────────────
+
+cmd_create() {
+  local id="" scenarios_str=""
+
+  # Parse args
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --id=*)        id="${1#--id=}" ;;
+      --scenarios=*) scenarios_str="${1#--scenarios=}" ;;
+      *)             die "Unknown option: $1" ;;
+    esac
+    shift
+  done
+
+  # Default: all scenarios
+  if [[ -z "$scenarios_str" ]]; then
+    scenarios_str=$(IFS=,; echo "${ALL_SCENARIOS[*]}")
+  fi
+
+  # Parse scenario list
+  IFS=',' read -ra scenarios <<< "$scenarios_str"
+
+  # Validate scenarios
+  for s in "${scenarios[@]}"; do
+    local valid=false
+    for v in "${ALL_SCENARIOS[@]}"; do
+      [[ "$s" == "$v" ]] && valid=true && break
+    done
+    $valid || die "Unknown scenario: $s (available: ${ALL_SCENARIOS[*]})"
+  done
+
+  # Generate ID if not provided
+  if [[ -z "$id" ]]; then
+    id=$(generate_id)
+  fi
+
+  # Check for ID collision
+  if [[ -d "${SANDBOXES_DIR}/sb-${id}" ]]; then
+    die "Sandbox $id already exists"
+  fi
+
+  log "Creating sandbox: $id"
+  log "Scenarios: ${scenarios[*]}"
+
+  # 1. Find available ports
+  local ports
+  ports=$(find_available_ports)
+  local es_port kb_port mcp_port
+  es_port=$(echo "$ports" | awk '{print $1}')
+  kb_port=$(echo "$ports" | awk '{print $2}')
+  mcp_port=$(echo "$ports" | awk '{print $3}')
+
+  log "Ports — ES: $es_port, Kibana: $kb_port, MCP: $mcp_port"
+
+  # 2. Initialize manifest
+  manifest_init "$id" "$es_port" "$kb_port" "${scenarios[@]}"
+
+  # Store MCP port in manifest
+  manifest_update "$id" --argjson mcp_port "$mcp_port" '.mcp_port = $mcp_port'
+
+  # 3. Ensure Docker network exists
+  ensure_network
+
+  # 4. Start ES container, wait for ready
+  local es_container
+  es_container=$(start_es "$id" "$es_port")
+  wait_for_es "$es_port"
+
+  # 5. Activate trial license + set kibana_system password
+  activate_trial "$es_port"
+  set_kibana_password "$es_port"
+
+  # 6. Start Kibana container
+  local kb_container
+  kb_container=$(start_kibana "$id" "$kb_port" "$es_container")
+
+  # 7. Write encryption keys to kibana.yml, then wait for Kibana
+  #    (need to wait briefly for container to start before writing)
+  sleep 5
+  write_kibana_encryption_keys "$kb_container"
+  wait_for_kibana "$kb_port"
+
+  # 8. Run each scenario's setup + data
+  for scenario in "${scenarios[@]}"; do
+    log "═══ Running scenario: $scenario ═══"
+    run_scenario_setup "$scenario" "$es_port" "$id"
+    run_scenario_data "$scenario" "$es_port" "$id"
+
+    # Merge golden answers into manifest
+    local golden_file="${SCRIPT_DIR}/scenarios/${scenario}/golden.json"
+    manifest_merge_golden "$id" "$golden_file"
+  done
+
+  # 9. Start MCP server
+  log "Starting MCP server on port $mcp_port"
+  local mcp_pid
+  mcp_pid=$(start_mcp_server "$id" "$es_port" "$mcp_port")
+  manifest_update "$id" --argjson mcp_pid "$mcp_pid" '.mcp_pid = $mcp_pid'
+  wait_for_mcp "$mcp_port" || warn "MCP server may not be ready"
+
+  # 10. Set up Agent Builder (tools + agent + MCP connector)
+  setup_sandbox_agent "$id" "$kb_port" "$es_port" "$mcp_port" "${scenarios[@]}"
+
+  # 11. Print summary
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  Sandbox created: $id"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  ES:      http://localhost:${es_port}  (elastic / ${ELASTIC_PASSWORD})"
+  echo "  Kibana:  http://localhost:${kb_port}  (elastic / ${ELASTIC_PASSWORD})"
+  echo "  MCP:     http://localhost:${mcp_port}/mcp"
+  echo "  Agent:   http://localhost:${kb_port}/app/agent_builder"
+  echo ""
+  echo "  Scenarios: ${scenarios[*]}"
+  echo "  Manifest:  sandboxes/sb-${id}/manifest.json"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+cmd_destroy() {
+  if [[ "${1:-}" == "--all" ]]; then
+    local ids
+    ids=$(manifest_list_ids)
+    if [[ -z "$ids" ]]; then
+      log "No sandboxes to destroy"
+      return 0
+    fi
+    for id in $ids; do
+      cmd_destroy "$id"
+    done
+    return 0
+  fi
+
+  local id="${1:-}"
+  [[ -n "$id" ]] || die "Usage: sandbox destroy <id> | --all"
+
+  local manifest_file
+  manifest_file="$(manifest_path "$id")"
+
+  if [[ ! -f "$manifest_file" ]]; then
+    die "Sandbox $id not found"
+  fi
+
+  local es_container kb_container mcp_pid
+  es_container=$(manifest_get "$id" '.es_container')
+  kb_container=$(manifest_get "$id" '.kibana_container')
+  mcp_pid=$(manifest_get "$id" '.mcp_pid // empty')
+
+  # Stop MCP server
+  if [[ -n "$mcp_pid" ]]; then
+    stop_mcp_server "$mcp_pid"
+  fi
+
+  # Remove containers
+  stop_sandbox "$es_container" "$kb_container"
+
+  # Remove sandbox directory
+  local sandbox_dir
+  sandbox_dir="$(manifest_dir "$id")"
+  rm -rf "$sandbox_dir"
+
+  log "Sandbox $id destroyed"
+}
+
+cmd_list() {
+  local ids
+  ids=$(manifest_list_ids)
+
+  if [[ -z "$ids" ]]; then
+    echo "No sandboxes found."
+    return 0
+  fi
+
+  printf '%-8s  %-7s  %-9s  %-6s  %-30s  %s\n' "ID" "ES" "KIBANA" "MCP" "SCENARIOS" "CREATED"
+  printf '%-8s  %-7s  %-9s  %-6s  %-30s  %s\n' "──────" "─────" "───────" "────" "────────────────────────────" "───────────────────"
+
+  for id in $ids; do
+    local es_port kb_port mcp_port scenarios created
+    es_port=$(manifest_get "$id" '.es_port')
+    kb_port=$(manifest_get "$id" '.kibana_port')
+    mcp_port=$(manifest_get "$id" '.mcp_port // "n/a"')
+    scenarios=$(manifest_get "$id" '.scenarios | join(",")')
+    created=$(manifest_get "$id" '.created_at')
+
+    # Check if containers are running
+    local es_container kb_container es_status kb_status
+    es_container=$(manifest_get "$id" '.es_container')
+    kb_container=$(manifest_get "$id" '.kibana_container')
+    es_status=$(docker inspect -f '{{.State.Status}}' "$es_container" 2>/dev/null || echo "gone")
+    kb_status=$(docker inspect -f '{{.State.Status}}' "$kb_container" 2>/dev/null || echo "gone")
+
+    printf '%-8s  :%s(%s)  :%s(%s)  :%s  %-30s  %s\n' \
+      "$id" "$es_port" "${es_status:0:2}" "$kb_port" "${kb_status:0:2}" "$mcp_port" "$scenarios" "$created"
+  done
+}
+
+cmd_reset() {
+  local id="${1:-}"
+  [[ -n "$id" ]] || die "Usage: sandbox reset <id>"
+
+  local manifest_file
+  manifest_file="$(manifest_path "$id")"
+  [[ -f "$manifest_file" ]] || die "Sandbox $id not found"
+
+  # Read scenarios before destroying
+  local scenarios_str
+  scenarios_str=$(manifest_get "$id" '.scenarios | join(",")')
+
+  log "Resetting sandbox $id (scenarios: $scenarios_str)"
+
+  # Destroy then recreate with same scenarios and same ID
+  cmd_destroy "$id"
+  cmd_create --id="$id" --scenarios="$scenarios_str"
+}
+
+# ── Workload ────────────────────────────────────────────────────────────────
+
+cmd_workload() {
+  local id="${1:-}"
+  [[ -n "$id" ]] || die "Usage: sandbox workload <id>"
+
+  local manifest_file
+  manifest_file="$(manifest_path "$id")"
+  [[ -f "$manifest_file" ]] || die "Sandbox $id not found"
+
+  local es_port scenarios_json
+  es_port=$(manifest_get "$id" '.es_port')
+  scenarios_json=$(manifest_get "$id" '.scenarios')
+
+  local sandbox_dir
+  sandbox_dir="$(manifest_dir "$id")"
+
+  log "Running workloads for sandbox $id on port $es_port"
+
+  local all_reports="[]"
+
+  # Run workload for each scenario
+  while IFS= read -r scenario; do
+    log "═══ Workload: $scenario ═══"
+    local report
+    report=$(run_scenario_workload "$scenario" "$es_port" "$id")
+
+    # Save individual report
+    echo "$report" | jq . > "${sandbox_dir}/workload-${scenario}.json"
+    log "Report saved: sandboxes/sb-${id}/workload-${scenario}.json"
+
+    all_reports=$(echo "$all_reports" | jq --argjson r "$report" '. += [$r]')
+  done < <(echo "$scenarios_json" | jq -r '.[]')
+
+  # Save combined report
+  local combined
+  combined=$(jq -n \
+    --arg id "$id" \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --argjson reports "$all_reports" \
+    '{
+      sandbox_id: $id,
+      completed_at: $ts,
+      scenarios: $reports,
+      totals: {
+        queries_run: [$reports[].summary.total_queries] | add,
+        total_errors: [$reports[].summary.errors | length] | add,
+        all_errors: [.scenarios[]?.summary.errors[]?] | unique
+      }
+    }')
+  echo "$combined" | jq . > "${sandbox_dir}/workload-report.json"
+
+  # Print summary
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  WORKLOAD REPORT — Sandbox $id"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  echo "$all_reports" | jq -r '.[] |
+    "\n  Scenario: \(.scenario)\n  Queries: \(.summary.total_queries)  |  Errors: \(.summary.errors | length)  |  Avg: \(.summary.avg_wall_ms)ms  |  Max: \(.summary.max_wall_ms)ms" +
+    if (.summary.errors | length) > 0 then "\n  Failed: \(.summary.errors | join(", "))" else "" end'
+
+  echo ""
+  echo "  Full report: sandboxes/sb-${id}/workload-report.json"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+# ── Diagnose ────────────────────────────────────────────────────────────────
+
+cmd_diagnose() {
+  local id="${1:-}"
+  [[ -n "$id" ]] || die "Usage: sandbox diagnose <id>"
+
+  local manifest_file
+  manifest_file="$(manifest_path "$id")"
+  [[ -f "$manifest_file" ]] || die "Sandbox $id not found"
+
+  local es_port
+  es_port=$(manifest_get "$id" '.es_port')
+
+  local sandbox_dir
+  sandbox_dir="$(manifest_dir "$id")"
+
+  local snapshot
+  snapshot=$(collect_diagnostics "$es_port" "$id")
+  echo "$snapshot" | jq . > "${sandbox_dir}/diagnostic-snapshot.json"
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  DIAGNOSTIC SNAPSHOT — Sandbox $id"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  Cluster health: $(echo "$snapshot" | jq -r '.cluster.health')"
+  echo "  Nodes: $(echo "$snapshot" | jq -r '.cluster.node_count')"
+  echo "  Active shards: $(echo "$snapshot" | jq -r '.cluster.active_shards')"
+  echo "  Unassigned: $(echo "$snapshot" | jq -r '.cluster.unassigned_shards')"
+  echo ""
+  echo "  Indices:"
+  echo "$snapshot" | jq -r '.indices[] | "    \(.index)  health=\(.health)  pri=\(.pri)  rep=\(.rep)  docs=\(."docs.count")  size=\(."store.size")"'
+  echo ""
+  echo "  Saved to: sandboxes/sb-${id}/diagnostic-snapshot.json"
+  echo ""
+  echo "  Feed this file to an LLM for diagnosis, then score with:"
+  echo "    ./sandbox eval $id --diagnosis=<agent-output.json>"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+# ── Eval ────────────────────────────────────────────────────────────────────
+
+cmd_eval() {
+  local id="" diagnosis_file=""
+
+  # Parse args
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --diagnosis=*) diagnosis_file="${1#--diagnosis=}" ;;
+      *)
+        if [[ -z "$id" ]]; then
+          id="$1"
+        else
+          die "Unknown option: $1"
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  [[ -n "$id" ]] || die "Usage: sandbox eval <id> --diagnosis=<file.json>"
+  [[ -n "$diagnosis_file" ]] || die "Missing --diagnosis=<file.json>"
+  [[ -f "$diagnosis_file" ]] || die "Diagnosis file not found: $diagnosis_file"
+
+  local manifest_file
+  manifest_file="$(manifest_path "$id")"
+  [[ -f "$manifest_file" ]] || die "Sandbox $id not found"
+
+  local sandbox_dir
+  sandbox_dir="$(manifest_dir "$id")"
+
+  # Extract golden from manifest
+  local golden_file="${sandbox_dir}/golden-extracted.json"
+  manifest_get "$id" '.golden' > "$golden_file"
+
+  # Score
+  local scorecard
+  scorecard=$(score_diagnosis "$golden_file" "$diagnosis_file")
+
+  # Save scorecard
+  echo "$scorecard" | jq . > "${sandbox_dir}/eval-scorecard.json"
+
+  # Print it
+  print_scorecard "$scorecard"
+
+  echo "  Scorecard saved: sandboxes/sb-${id}/eval-scorecard.json"
+  echo ""
+
+  rm -f "$golden_file"
+}
+
+# ── Simulate ────────────────────────────────────────────────────────────────
+
+cmd_simulate() {
+  local id="" eval_name=""
+
+  # Parse args
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --eval=*) eval_name="${1#--eval=}" ;;
+      *)
+        if [[ -z "$id" ]]; then
+          id="$1"
+        else
+          die "Unknown option: $1"
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  [[ -n "$id" ]] || die "Usage: sandbox simulate <id> [--eval=name]"
+
+  local manifest_file
+  manifest_file="$(manifest_path "$id")"
+  [[ -f "$manifest_file" ]] || die "Sandbox $id not found"
+
+  local es_port
+  es_port=$(manifest_get "$id" '.es_port')
+
+  # If no eval specified, pick based on scenarios
+  if [[ -z "$eval_name" ]]; then
+    local scenario_count
+    scenario_count=$(manifest_get "$id" '.scenarios | length')
+    if (( scenario_count > 1 )); then
+      eval_name="mixed-degradation"
+    else
+      eval_name=$(manifest_get "$id" '.scenarios[0]')
+    fi
+    log "Auto-selected eval: $eval_name"
+  fi
+
+  # Validate eval name
+  local valid=false
+  for e in "${ALL_EVALS[@]}"; do
+    [[ "$eval_name" == "$e" ]] && valid=true && break
+  done
+  $valid || die "Unknown eval: $eval_name (available: ${ALL_EVALS[*]})"
+
+  # Source and run the eval
+  local eval_script="${SCRIPT_DIR}/evals/${eval_name}.sh"
+  [[ -f "$eval_script" ]] || die "Eval script not found: $eval_script"
+  source "$eval_script"
+
+  case "$eval_name" in
+    bad-mapping)        eval_bad_mapping "$es_port" "$id" ;;
+    over-sharded)       eval_over_sharded "$es_port" "$id" ;;
+    slow-queries)       eval_slow_queries "$es_port" "$id" ;;
+    bad-replicas)       eval_bad_replicas "$es_port" "$id" ;;
+    mixed-degradation)  eval_mixed_degradation "$es_port" "$id" ;;
+  esac
+}
+
+# ── Usage ───────────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<'EOF'
+Usage: ./sandbox <command> [options]
+
+Commands:
+  create [--scenarios=s1,s2] [--id=custom-id]   Create a new sandbox
+  destroy <id>                                   Destroy a sandbox
+  destroy --all                                  Destroy all sandboxes
+  list                                           List all sandboxes
+  reset <id>                                     Destroy + recreate a sandbox
+  workload <id>                                  Run batch workloads (quick check)
+  simulate <id> [--eval=name]                    Run realtime phased simulation
+  diagnose <id>                                  Collect cluster diagnostic snapshot
+  eval <id> --diagnosis=<file.json>              Score agent output against golden
+
+Available scenarios:
+  bad-mapping     Indices with wrong field types
+  over-sharded    Index with too many shards for its data
+  slow-queries    Low slow-log thresholds + expensive query patterns
+  bad-replicas    Replica misconfiguration (too many / too few)
+
+Available simulations (--eval):
+  bad-mapping         Analysts build dashboards on bad types
+  over-sharded        Traffic ramp exposes shard fan-out overhead
+  slow-queries        Bad deploy + report job floods expensive queries
+  bad-replicas        Load ramp on misconfigured replicas
+  mixed-degradation   All problems compound simultaneously (default for multi-scenario)
+
+Eval workflow:
+  1. ./sandbox create --id=test1
+  2. ./sandbox simulate test1              # Realtime phased query stream
+  3. ./sandbox diagnose test1              # Collect snapshot for LLM input
+  4. Feed diagnostic-snapshot.json to your agent/LLM
+  5. Save agent output as JSON
+  6. ./sandbox eval test1 --diagnosis=agent-output.json
+
+Examples:
+  ./sandbox create
+  ./sandbox create --scenarios=bad-mapping
+  ./sandbox simulate a1f3                          # Auto-picks eval
+  ./sandbox simulate a1f3 --eval=slow-queries      # Specific eval
+  ./sandbox simulate a1f3 --eval=mixed-degradation # Everything at once
+  ./sandbox diagnose a1f3
+  ./sandbox eval a1f3 --diagnosis=output.json
+  ./sandbox destroy --all
+EOF
+}
+
+# ── Dispatch ────────────────────────────────────────────────────────────────
+
+command="${1:-}"
+shift || true
+
+case "$command" in
+  create)   cmd_create "$@" ;;
+  destroy)  cmd_destroy "$@" ;;
+  list)     cmd_list ;;
+  reset)    cmd_reset "$@" ;;
+  workload)  cmd_workload "$@" ;;
+  simulate)  cmd_simulate "$@" ;;
+  diagnose)  cmd_diagnose "$@" ;;
+  eval)      cmd_eval "$@" ;;
+  help|-h|--help) usage ;;
+  "")       usage; exit 1 ;;
+  *)        die "Unknown command: $command. Run './sandbox help' for usage." ;;
+esac

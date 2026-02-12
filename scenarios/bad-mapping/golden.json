@@ -1,0 +1,45 @@
+{
+  "bad-mapping": {
+    "description": "Index has incorrect field type mappings causing poor search, aggregation, and sorting behavior",
+    "index": "sb-{id}-bad-mapping-logs",
+    "problems": [
+      {
+        "field": "timestamp",
+        "current_type": "text",
+        "correct_type": "date",
+        "impact": "Cannot do date range queries, date histograms, or sort by time. Text analysis on ISO timestamps is useless."
+      },
+      {
+        "field": "message",
+        "current_type": "keyword",
+        "correct_type": "text",
+        "impact": "Cannot do full-text search on log messages. Keyword requires exact match which is impractical for log lines."
+      },
+      {
+        "field": "service",
+        "current_type": "text",
+        "correct_type": "keyword",
+        "impact": "Cannot aggregate by service name. Text analysis splits 'api-gateway' into tokens. Terms aggregation on text fields is disabled by default."
+      },
+      {
+        "field": "duration_ms",
+        "current_type": "text",
+        "correct_type": "float",
+        "impact": "Cannot do range queries, percentile aggregations, or sort numerically. All comparisons are lexicographic."
+      },
+      {
+        "field": "status_code",
+        "current_type": "text",
+        "correct_type": "keyword",
+        "impact": "Cannot aggregate by status code efficiently. Text analysis unnecessary for HTTP status codes."
+      },
+      {
+        "field": "user_id",
+        "current_type": "text",
+        "correct_type": "keyword",
+        "impact": "Cannot filter or aggregate by user ID. Text analysis splits 'user-123' into tokens."
+      }
+    ],
+    "fix": "Reindex with correct mappings. Create new index with proper types, use _reindex API to copy data, then swap aliases."
+  }
+}
