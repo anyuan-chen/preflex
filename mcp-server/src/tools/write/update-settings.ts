@@ -18,41 +18,68 @@ export function registerUpdateSettings(server: McpServer): void {
         .describe('Settings object, e.g. {"index.number_of_replicas": 0}'),
     },
   }, async ({ index, settings }) => {
-    if (config.verifyMode === "hitl") {
-      // Preview mode: show what would change
-      const current = await esFetch<Record<string, unknown>>(
+    try {
+      if (config.verifyMode === "hitl") {
+        // Preview mode: show what would change
+        const current = await esFetch<Record<string, unknown>>(
+          "GET",
+          `/${index}/_settings?flat_settings=true`,
+        );
+        const preview = {
+          action: "update_settings",
+          index,
+          proposed_settings: settings,
+          current_settings: current,
+        };
+        const opId = storePendingOperation("update_settings", { index, settings }, preview);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              mode: "preview",
+              operation_id: opId,
+              ...preview,
+              message: `HITL mode: review the proposed changes. Use confirm_operation("${opId}") to apply or cancel_operation("${opId}") to discard.`,
+            }, null, 2),
+          }],
+        };
+      }
+
+      // Capture baseline settings for potential rollback
+      const beforeSettings = await esFetch<Record<string, unknown>>(
         "GET",
-        `/${encodeURIComponent(index)}/_settings?flat_settings=true`,
+        `/${index}/_settings?flat_settings=true`,
       );
-      const preview = {
-        action: "update_settings",
-        index,
-        proposed_settings: settings,
-        current_settings: current,
-      };
-      const opId = storePendingOperation("update_settings", { index, settings }, preview);
+
+      // Apply the settings
+      await esFetch("PUT", `/${index}/_settings`, settings);
+
+      // Read back to confirm
+      const afterSettings = await esFetch<Record<string, unknown>>(
+        "GET",
+        `/${index}/_settings?flat_settings=true`,
+      );
+
+      // Check cluster health after change
+      const health = await esFetch<Record<string, unknown>>(
+        "GET",
+        `/_cluster/health/${index}`,
+      );
+
       return {
         content: [{
           type: "text" as const,
           text: JSON.stringify({
-            mode: "preview",
-            operation_id: opId,
-            ...preview,
-            message: `HITL mode: review the proposed changes. Use confirm_operation("${opId}") to apply or cancel_operation("${opId}") to discard.`,
+            success: true,
+            action: "update_settings",
+            index,
+            applied_settings: settings,
+            before_settings: beforeSettings,
+            after_settings: afterSettings,
+            cluster_health: health,
           }, null, 2),
         }],
       };
-    }
-
-    // Capture baseline settings for potential rollback
-    const beforeSettings = await esFetch<Record<string, unknown>>(
-      "GET",
-      `/${encodeURIComponent(index)}/_settings?flat_settings=true`,
-    );
-
-    // Apply the settings
-    try {
-      await esFetch("PUT", `/${encodeURIComponent(index)}/_settings`, settings);
     } catch (err) {
       return {
         content: [{
@@ -68,32 +95,5 @@ export function registerUpdateSettings(server: McpServer): void {
         isError: true,
       };
     }
-
-    // Read back to confirm
-    const afterSettings = await esFetch<Record<string, unknown>>(
-      "GET",
-      `/${encodeURIComponent(index)}/_settings?flat_settings=true`,
-    );
-
-    // Check cluster health after change
-    const health = await esFetch<Record<string, unknown>>(
-      "GET",
-      `/_cluster/health/${encodeURIComponent(index)}`,
-    );
-
-    return {
-      content: [{
-        type: "text" as const,
-        text: JSON.stringify({
-          success: true,
-          action: "update_settings",
-          index,
-          applied_settings: settings,
-          before_settings: beforeSettings,
-          after_settings: afterSettings,
-          cluster_health: health,
-        }, null, 2),
-      }],
-    };
   });
 }

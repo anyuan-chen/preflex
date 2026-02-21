@@ -22,7 +22,14 @@ export function registerReindex(server: McpServer): void {
         .optional()
         .describe("Optional settings for the target index"),
     },
-  }, async ({ source_index, target_index, target_mappings, target_settings }) => {
+  }, async ({ source_index, target_index, target_mappings: rawMappings, target_settings }) => {
+    // LLMs sometimes wrap mappings in { properties: { ... } } — unwrap if so
+    const target_mappings = (
+      rawMappings.properties &&
+      typeof rawMappings.properties === "object" &&
+      !rawMappings.properties.type
+    ) ? rawMappings.properties as Record<string, unknown> : rawMappings;
+
     if (config.verifyMode === "hitl") {
       const sourceMapping = await esFetch("GET", `/${encodeURIComponent(source_index)}/_mapping`);
       const sourceCount = await esFetch<{ count: number }>("GET", `/${encodeURIComponent(source_index)}/_count`);
@@ -111,7 +118,10 @@ export function registerReindex(server: McpServer): void {
       };
     }
 
-    // 4. Verify
+    // 4. Refresh target index so _count reflects all reindexed docs
+    await esFetch("POST", `/${encodeURIComponent(target_index)}/_refresh`);
+
+    // 5. Verify
     const targetCount = await esFetch<{ count: number }>(
       "GET",
       `/${encodeURIComponent(target_index)}/_count`,

@@ -8,42 +8,42 @@ import type { VerifyQuery } from "./types.js";
 export const SCENARIO_QUERIES: Record<string, VerifyQuery[]> = {
   "bad-mapping": [
     {
-      label: "date_range_on_timestamp",
-      index_suffix: "bad-mapping-logs",
-      query_body: { query: { range: { timestamp: { gte: "2026-02-12" } } }, size: 5 },
+      label: "date_range_on_order_date",
+      index_suffix: "orders",
+      query_body: { query: { range: { order_date: { gte: "2026-02-12" } } }, size: 5 },
       expected_behavior: "should_work",
     },
     {
       label: "date_histogram",
-      index_suffix: "bad-mapping-logs",
+      index_suffix: "orders",
       query_body: {
         size: 0,
-        aggs: { over_time: { date_histogram: { field: "timestamp", calendar_interval: "hour" } } },
+        aggs: { over_time: { date_histogram: { field: "order_date", calendar_interval: "hour" } } },
       },
       expected_behavior: "should_work",
     },
     {
-      label: "terms_agg_on_service",
-      index_suffix: "bad-mapping-logs",
-      query_body: { size: 0, aggs: { by_service: { terms: { field: "service" } } } },
+      label: "terms_agg_on_key_type",
+      index_suffix: "orders",
+      query_body: { size: 0, aggs: { by_key_type: { terms: { field: "key_type" } } } },
       expected_behavior: "should_work",
     },
     {
-      label: "numeric_range_duration",
-      index_suffix: "bad-mapping-logs",
-      query_body: { query: { range: { duration_ms: { gte: 1000 } } }, size: 5 },
+      label: "numeric_range_price",
+      index_suffix: "orders",
+      query_body: { query: { range: { price: { gte: 50 } } }, size: 5 },
       expected_behavior: "should_work",
     },
     {
-      label: "sort_by_duration",
-      index_suffix: "bad-mapping-logs",
-      query_body: { sort: [{ duration_ms: "desc" }], size: 10 },
+      label: "sort_by_price",
+      index_suffix: "orders",
+      query_body: { sort: [{ price: "desc" }], size: 10 },
       expected_behavior: "should_work",
     },
     {
-      label: "full_text_search_message",
-      index_suffix: "bad-mapping-logs",
-      query_body: { query: { match: { message: "error timeout" } }, size: 10 },
+      label: "full_text_search_description",
+      index_suffix: "orders",
+      query_body: { query: { match: { description: "deadbolt rekey" } }, size: 10 },
       expected_behavior: "should_work",
     },
   ],
@@ -51,31 +51,31 @@ export const SCENARIO_QUERIES: Record<string, VerifyQuery[]> = {
   "over-sharded": [
     {
       label: "match_all",
-      index_suffix: "over-sharded-metrics",
+      index_suffix: "key-inventory",
       query_body: { query: { match_all: {} }, size: 10 },
       expected_behavior: "should_be_faster",
     },
     {
-      label: "terms_agg_host",
-      index_suffix: "over-sharded-metrics",
-      query_body: { size: 0, aggs: { by_host: { terms: { field: "host" } } } },
+      label: "terms_agg_brand",
+      index_suffix: "key-inventory",
+      query_body: { size: 0, aggs: { by_brand: { terms: { field: "brand" } } } },
       expected_behavior: "should_be_faster",
     },
     {
       label: "percentiles",
-      index_suffix: "over-sharded-metrics",
-      query_body: { size: 0, aggs: { pct: { percentiles: { field: "value" } } } },
+      index_suffix: "key-inventory",
+      query_body: { size: 0, aggs: { pct: { percentiles: { field: "quantity" } } } },
       expected_behavior: "should_be_faster",
     },
     {
       label: "nested_agg",
-      index_suffix: "over-sharded-metrics",
+      index_suffix: "key-inventory",
       query_body: {
         size: 0,
         aggs: {
-          by_host: {
-            terms: { field: "host" },
-            aggs: { avg_val: { avg: { field: "value" } } },
+          by_brand: {
+            terms: { field: "brand" },
+            aggs: { avg_qty: { avg: { field: "quantity" } } },
           },
         },
       },
@@ -86,34 +86,34 @@ export const SCENARIO_QUERIES: Record<string, VerifyQuery[]> = {
   "slow-queries": [
     {
       label: "basic_filter",
-      index_suffix: "slow-query-logs",
-      query_body: { query: { term: { level: "ERROR" } }, size: 10 },
+      index_suffix: "service-logs",
+      query_body: { query: { term: { service_type: "lockout" } }, size: 10 },
       expected_behavior: "should_return_results",
     },
     {
-      label: "service_filter",
-      index_suffix: "slow-query-logs",
-      query_body: { query: { term: { service: "api-gateway" } }, size: 10 },
+      label: "technician_filter",
+      index_suffix: "service-logs",
+      query_body: { query: { term: { technician: "tech-001" } }, size: 10 },
       expected_behavior: "should_return_results",
     },
   ],
 
   "bad-replicas": [
     {
-      label: "match_all_overreplicated",
-      index_suffix: "bad-replicas-overreplicated",
+      label: "match_all_appointments",
+      index_suffix: "appointments",
       query_body: { query: { match_all: {} }, size: 10 },
       expected_behavior: "should_return_results",
     },
     {
-      label: "match_all_critical",
-      index_suffix: "bad-replicas-critical-noreplica",
+      label: "match_all_billing",
+      index_suffix: "customer-billing",
       query_body: { query: { match_all: {} }, size: 10 },
       expected_behavior: "should_return_results",
     },
     {
       label: "terms_agg_event",
-      index_suffix: "bad-replicas-overreplicated",
+      index_suffix: "appointments",
       query_body: { size: 0, aggs: { by_event: { terms: { field: "event" } } } },
       expected_behavior: "should_return_results",
     },

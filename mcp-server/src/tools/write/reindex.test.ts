@@ -56,6 +56,7 @@ describe("reindex tool", () => {
         .mockResolvedValueOnce({ count: 500 })  // source _count
         .mockResolvedValueOnce({ acknowledged: true })  // PUT target
         .mockResolvedValueOnce({ created: 500, failures: [] })  // _reindex
+        .mockResolvedValueOnce({ _shards: { successful: 1 } })  // target _refresh
         .mockResolvedValueOnce({ count: 500 })  // target _count
         .mockResolvedValueOnce({ "target": { mappings: { properties: { ts: { type: "date" } } } } });  // target _mapping
 
@@ -77,6 +78,7 @@ describe("reindex tool", () => {
         .mockResolvedValueOnce({ count: 100 })
         .mockResolvedValueOnce({ acknowledged: true })
         .mockResolvedValueOnce({ created: 100, failures: [] })
+        .mockResolvedValueOnce({ _shards: { successful: 1 } })  // _refresh
         .mockResolvedValueOnce({ count: 100 })
         .mockResolvedValueOnce({});
 
@@ -138,6 +140,7 @@ describe("reindex tool", () => {
         .mockResolvedValueOnce({ count: 500 })  // source _count
         .mockResolvedValueOnce({ acknowledged: true })
         .mockResolvedValueOnce({ created: 490, failures: [] })
+        .mockResolvedValueOnce({ _shards: { successful: 1 } })  // _refresh
         .mockResolvedValueOnce({ count: 490 })  // target _count (mismatch!)
         .mockResolvedValueOnce({});
 
@@ -158,6 +161,7 @@ describe("reindex tool", () => {
         .mockResolvedValueOnce({ count: 100 })
         .mockResolvedValueOnce({ acknowledged: true })
         .mockResolvedValueOnce({ created: 99, failures: [{ cause: "mapping error" }] })
+        .mockResolvedValueOnce({ _shards: { successful: 1 } })  // _refresh
         .mockResolvedValueOnce({ count: 99 })
         .mockResolvedValueOnce({});
 
