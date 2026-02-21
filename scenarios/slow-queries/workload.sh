@@ -3,7 +3,7 @@
 
 workload_slow_queries() {
   local port="$1" id="$2"
-  local index="sb-${id}-slow-query-logs"
+  local index="sb-${id}-service-logs"
 
   log "Running slow-queries workload on $index"
 
@@ -15,7 +15,7 @@ workload_slow_queries() {
   q1=$(timed_query "$port" POST "/${index}/_search" '{
     "query": {
       "wildcard": {
-        "message": { "value": "*timeout*" }
+        "message": { "value": "*lockout*" }
       }
     },
     "size": 5
@@ -51,9 +51,9 @@ workload_slow_queries() {
   q4=$(timed_query "$port" POST "/${index}/_search" '{
     "size": 0,
     "aggs": {
-      "all_traces": {
+      "all_jobs": {
         "terms": {
-          "field": "trace_id",
+          "field": "job_id",
           "size": 100000
         }
       }
@@ -67,8 +67,8 @@ workload_slow_queries() {
     "query": {
       "bool": {
         "filter": [
-          { "term": { "service": "api-gateway" } },
-          { "term": { "level": "ERROR" } }
+          { "term": { "service_type": "key-cutting" } },
+          { "term": { "technician": "tech-001" } }
         ]
       }
     },
@@ -81,7 +81,7 @@ workload_slow_queries() {
   q6=$(timed_query "$port" POST "/${index}/_search" '{
     "query": {
       "regexp": {
-        "message": ".*fail.*auth.*"
+        "message": ".*lock.*rekey.*"
       }
     },
     "size": 5
@@ -108,10 +108,10 @@ workload_slow_queries() {
       slowlog_thresholds: $slowlog,
       search_stats: ($search_stats | .indices | to_entries[0].value.primaries.search // {}),
       problematic_patterns: [
-        "Leading wildcard: *timeout* — cannot use inverted index",
+        "Leading wildcard: *lockout* — cannot use inverted index",
         "Script score on match_all — executes on every document",
         "Deep pagination from=10000 — fetches and discards 10k results",
-        "High-cardinality terms agg size=100000 on trace_id — massive memory use",
+        "High-cardinality terms agg size=100000 on job_id — massive memory use",
         "Regex with .* prefix — equivalent to leading wildcard"
       ]
     }')

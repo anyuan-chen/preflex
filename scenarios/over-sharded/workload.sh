@@ -3,7 +3,7 @@
 
 workload_over_sharded() {
   local port="$1" id="$2"
-  local index="sb-${id}-over-sharded-metrics"
+  local index="sb-${id}-key-inventory"
 
   log "Running over-sharded workload on $index"
 
@@ -23,8 +23,8 @@ workload_over_sharded() {
   q2=$(timed_query "$port" POST "/${index}/_search" '{
     "size": 0,
     "aggs": {
-      "by_host": {
-        "terms": { "field": "host" }
+      "by_brand": {
+        "terms": { "field": "brand" }
       }
     }
   }' "terms_agg_all_shards")
@@ -51,8 +51,8 @@ workload_over_sharded() {
     "query": {
       "bool": {
         "filter": [
-          { "term": { "host": "web-01" } },
-          { "term": { "metric_name": "cpu_usage" } }
+          { "term": { "brand": "Kwikset" } },
+          { "term": { "key_type": "blank" } }
         ]
       }
     },

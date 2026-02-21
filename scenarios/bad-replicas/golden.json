@@ -1,23 +1,23 @@
 {
   "bad-replicas": {
     "description": "Two indices with opposite replica misconfigurations: one with too many replicas for a single-node cluster, one with zero replicas for critical data",
-    "indices": ["sb-{id}-bad-replicas-overreplicated", "sb-{id}-bad-replicas-critical-noreplica"],
+    "indices": ["sb-{id}-appointments", "sb-{id}-customer-billing"],
     "problems": [
       {
-        "index": "sb-{id}-bad-replicas-overreplicated",
+        "index": "sb-{id}-appointments",
         "issue": "3 replicas on a single-node cluster",
         "evidence": "number_of_replicas=3 but only 1 data node. All 3 replica shards are unassigned. Cluster health is yellow.",
         "impact": "Cluster permanently yellow. Replica shards can never be allocated (no other nodes). Monitoring alerts fire constantly. Replicas provide no benefit on a single node.",
-        "fix": "Set replicas to 0 for single-node: PUT /sb-{id}-bad-replicas-overreplicated/_settings {\"index.number_of_replicas\": 0}. In production with multiple nodes, set to 1."
+        "fix": "Set replicas to 0 for single-node: PUT /sb-{id}-appointments/_settings {\"index.number_of_replicas\": 0}. In production with multiple nodes, set to 1."
       },
       {
-        "index": "sb-{id}-bad-replicas-critical-noreplica",
-        "issue": "Zero replicas for critical order/payment data",
-        "evidence": "number_of_replicas=0 for an index containing order and payment data",
+        "index": "sb-{id}-customer-billing",
+        "issue": "Zero replicas for critical billing/payment data",
+        "evidence": "number_of_replicas=0 for an index containing invoice and payment data",
         "impact": "No redundancy. If the single shard's node fails, data is lost. For critical financial data this is unacceptable in any multi-node production environment.",
-        "fix": "In production: PUT /sb-{id}-bad-replicas-critical-noreplica/_settings {\"index.number_of_replicas\": 1}. On single-node dev: 0 is correct, but flag that production must have >= 1."
+        "fix": "In production: PUT /sb-{id}-customer-billing/_settings {\"index.number_of_replicas\": 1}. On single-node dev: 0 is correct, but flag that production must have >= 1."
       }
     ],
-    "context": "On a single-node cluster, the correct replica count for all indices is 0. The optimizer should recognize this but also note that the critical-noreplica index MUST have replicas in a production multi-node setup."
+    "context": "On a single-node cluster, the correct replica count for all indices is 0. The optimizer should recognize this but also note that the customer-billing index MUST have replicas in a production multi-node setup."
   }
 }

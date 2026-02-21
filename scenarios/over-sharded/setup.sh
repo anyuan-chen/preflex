@@ -3,7 +3,7 @@
 
 setup_over_sharded() {
   local port="$1" id="$2"
-  local index="sb-${id}-over-sharded-metrics"
+  local index="sb-${id}-key-inventory"
 
   create_index "$port" "$index" '{
     "settings": {
@@ -12,11 +12,12 @@ setup_over_sharded() {
     },
     "mappings": {
       "properties": {
-        "timestamp":   { "type": "date" },
-        "host":        { "type": "keyword" },
-        "metric_name": { "type": "keyword" },
-        "value":       { "type": "float" },
-        "tags":        { "type": "keyword" }
+        "timestamp": { "type": "date" },
+        "sku":       { "type": "keyword" },
+        "brand":     { "type": "keyword" },
+        "key_type":  { "type": "keyword" },
+        "quantity":  { "type": "integer" },
+        "location":  { "type": "keyword" }
       }
     }
   }'

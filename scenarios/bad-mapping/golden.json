@@ -1,43 +1,43 @@
 {
   "bad-mapping": {
     "description": "Index has incorrect field type mappings causing poor search, aggregation, and sorting behavior",
-    "index": "sb-{id}-bad-mapping-logs",
+    "index": "sb-{id}-orders",
     "problems": [
       {
-        "field": "timestamp",
+        "field": "order_date",
         "current_type": "text",
         "correct_type": "date",
         "impact": "Cannot do date range queries, date histograms, or sort by time. Text analysis on ISO timestamps is useless."
       },
       {
-        "field": "message",
+        "field": "description",
         "current_type": "keyword",
         "correct_type": "text",
-        "impact": "Cannot do full-text search on log messages. Keyword requires exact match which is impractical for log lines."
+        "impact": "Cannot do full-text search on order descriptions. Keyword requires exact match which is impractical for free-text descriptions."
       },
       {
-        "field": "service",
+        "field": "key_type",
         "current_type": "text",
         "correct_type": "keyword",
-        "impact": "Cannot aggregate by service name. Text analysis splits 'api-gateway' into tokens. Terms aggregation on text fields is disabled by default."
+        "impact": "Cannot aggregate by key type. Text analysis splits values unnecessarily. Terms aggregation on text fields is disabled by default."
       },
       {
-        "field": "duration_ms",
+        "field": "price",
         "current_type": "text",
         "correct_type": "float",
         "impact": "Cannot do range queries, percentile aggregations, or sort numerically. All comparisons are lexicographic."
       },
       {
-        "field": "status_code",
+        "field": "status",
         "current_type": "text",
         "correct_type": "keyword",
-        "impact": "Cannot aggregate by status code efficiently. Text analysis unnecessary for HTTP status codes."
+        "impact": "Cannot aggregate by order status efficiently. Text analysis unnecessary for status values."
       },
       {
-        "field": "user_id",
+        "field": "customer_id",
         "current_type": "text",
         "correct_type": "keyword",
-        "impact": "Cannot filter or aggregate by user ID. Text analysis splits 'user-123' into tokens."
+        "impact": "Cannot filter or aggregate by customer ID. Text analysis splits 'cust-123' into tokens."
       }
     ],
     "fix": "Reindex with correct mappings. Create new index with proper types, use _reindex API to copy data, then swap aliases."

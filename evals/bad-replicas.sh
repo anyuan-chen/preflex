@@ -8,8 +8,8 @@
 
 eval_bad_replicas() {
   local port="$1" id="$2"
-  local idx_over="sb-${id}-bad-replicas-overreplicated"
-  local idx_crit="sb-${id}-bad-replicas-critical-noreplica"
+  local idx_over="sb-${id}-appointments"
+  local idx_crit="sb-${id}-customer-billing"
 
   pool_trickle() {
     local queries=(
@@ -25,7 +25,7 @@ eval_bad_replicas() {
     local queries=(
       "search_events|POST|/${idx_over}/_search|{\"query\":{\"match_all\":{}},\"size\":10}"
       "search_orders|POST|/${idx_crit}/_search|{\"query\":{\"match_all\":{}},\"size\":10}"
-      "filter_event|POST|/${idx_over}/_search|{\"query\":{\"term\":{\"event\":\"user.login\"}},\"size\":10}"
+      "filter_event|POST|/${idx_over}/_search|{\"query\":{\"term\":{\"event\":\"appointment.booked\"}},\"size\":10}"
       "filter_status|POST|/${idx_crit}/_search|{\"query\":{\"term\":{\"status\":\"pending\"}},\"size\":10}"
       "agg_events|POST|/${idx_over}/_search|{\"size\":0,\"aggs\":{\"by_event\":{\"terms\":{\"field\":\"event\"}}}}"
       "agg_revenue|POST|/${idx_crit}/_search|{\"size\":0,\"aggs\":{\"total\":{\"sum\":{\"field\":\"amount\"}}}}"
@@ -39,8 +39,8 @@ eval_bad_replicas() {
     local queries=(
       "search_events|POST|/${idx_over}/_search|{\"query\":{\"match_all\":{}},\"size\":20}"
       "search_orders|POST|/${idx_crit}/_search|{\"query\":{\"match_all\":{}},\"size\":20}"
-      "filter_event|POST|/${idx_over}/_search|{\"query\":{\"term\":{\"event\":\"order.created\"}},\"size\":20}"
-      "agg_by_user|POST|/${idx_over}/_search|{\"size\":0,\"aggs\":{\"by_user\":{\"terms\":{\"field\":\"user_id\",\"size\":100}}}}"
+      "filter_event|POST|/${idx_over}/_search|{\"query\":{\"term\":{\"event\":\"walk-in\"}},\"size\":20}"
+      "agg_by_customer|POST|/${idx_over}/_search|{\"size\":0,\"aggs\":{\"by_customer\":{\"terms\":{\"field\":\"customer_id\",\"size\":100}}}}"
       "agg_revenue_by_currency|POST|/${idx_crit}/_search|{\"size\":0,\"aggs\":{\"by_currency\":{\"terms\":{\"field\":\"currency\"},\"aggs\":{\"total\":{\"sum\":{\"field\":\"amount\"}}}}}}"
       "agg_by_status|POST|/${idx_crit}/_search|{\"size\":0,\"aggs\":{\"by_status\":{\"terms\":{\"field\":\"status\"}}}}"
       "date_hist_events|POST|/${idx_over}/_search|{\"size\":0,\"aggs\":{\"over_time\":{\"date_histogram\":{\"field\":\"timestamp\",\"calendar_interval\":\"hour\"}}}}"

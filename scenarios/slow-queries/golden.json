@@ -1,7 +1,7 @@
 {
   "slow-queries": {
     "description": "Slow log thresholds are set unreasonably low (1ms warn, 0ms info) and several query patterns are inherently expensive",
-    "indices": ["sb-{id}-slow-query-logs", "sb-{id}-slow-query-samples"],
+    "indices": ["sb-{id}-service-logs", "sb-{id}-service-log-queries"],
     "problems": [
       {
         "issue": "Unreasonably low slow log thresholds",
@@ -11,7 +11,7 @@
       },
       {
         "issue": "Leading wildcard queries",
-        "evidence": "Query pattern: {\"wildcard\":{\"message\":{\"value\":\"*timeout*\"}}}",
+        "evidence": "Query pattern: {\"wildcard\":{\"message\":{\"value\":\"*lockout*\"}}}",
         "impact": "Leading wildcards cannot use the inverted index. Forces a full scan of every term in the field. O(n) where n = unique terms.",
         "fix": "Use match query with appropriate analyzer, or use ngram tokenizer if substring search is required. If wildcard is necessary, avoid leading *."
       },
@@ -29,8 +29,8 @@
       },
       {
         "issue": "Unbounded high-cardinality aggregation",
-        "evidence": "terms aggregation on trace_id with size=100000",
-        "impact": "trace_id is high cardinality (unique per request). Aggregating 100k buckets requires large amounts of memory. Response payload is massive.",
+        "evidence": "terms aggregation on job_id with size=100000",
+        "impact": "job_id is high cardinality (unique per job). Aggregating 100k buckets requires large amounts of memory. Response payload is massive.",
         "fix": "Reduce size to a reasonable limit (10-100). Use composite aggregation for paginated access to all buckets. Consider if this aggregation is actually needed."
       }
     ]

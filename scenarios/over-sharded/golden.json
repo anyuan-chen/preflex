@@ -1,7 +1,7 @@
 {
   "over-sharded": {
     "description": "Index has 10 primary shards for only ~500 documents. Each shard holds ~50 docs, well below the recommended minimum of 10-50GB per shard.",
-    "index": "sb-{id}-over-sharded-metrics",
+    "index": "sb-{id}-key-inventory",
     "problems": [
       {
         "issue": "Excessive shard count",
@@ -13,9 +13,9 @@
     "fix": {
       "approach": "Shrink to 1 primary shard",
       "steps": [
-        "1. Block writes: PUT /sb-{id}-over-sharded-metrics/_settings {\"index.blocks.write\": true}",
-        "2. Shrink: POST /sb-{id}-over-sharded-metrics/_shrink/sb-{id}-over-sharded-metrics-shrunk {\"settings\": {\"index.number_of_shards\": 1, \"index.blocks.write\": null}}",
-        "3. Verify: GET /_cat/shards/sb-{id}-over-sharded-metrics-shrunk",
+        "1. Block writes: PUT /sb-{id}-key-inventory/_settings {\"index.blocks.write\": true}",
+        "2. Shrink: POST /sb-{id}-key-inventory/_shrink/sb-{id}-key-inventory-shrunk {\"settings\": {\"index.number_of_shards\": 1, \"index.blocks.write\": null}}",
+        "3. Verify: GET /_cat/shards/sb-{id}-key-inventory-shrunk",
         "4. Alias swap if needed"
       ],
       "alternative": "Reindex into a new 1-shard index if shrink prerequisites aren't met"
