@@ -28,6 +28,7 @@ start_es() {
     -e "ELASTIC_PASSWORD=${ELASTIC_PASSWORD}" \
     -e "ES_JAVA_OPTS=-Xms${ES_HEAP} -Xmx${ES_HEAP}" \
     -e "cluster.name=sb-${id}" \
+    -e "xpack.monitoring.collection.enabled=true" \
     "$ES_IMAGE" >/dev/null
 
   echo "$container"
@@ -36,6 +37,13 @@ start_es() {
 start_kibana() {
   local id="$1" kb_port="$2" es_container="$3"
   local container="sb-${id}-kb"
+
+  # Use warm image if available, otherwise fall back to base
+  local image="$KIBANA_IMAGE"
+  if has_warm_kibana_image; then
+    image="$KIBANA_WARM_TAG"
+    log "Using warm Kibana image: $image"
+  fi
 
   log "Starting Kibana container: $container on port $kb_port"
   docker run -d \
@@ -46,7 +54,7 @@ start_kibana() {
     -e "ELASTICSEARCH_USERNAME=kibana_system" \
     -e "ELASTICSEARCH_PASSWORD=${ELASTIC_PASSWORD}" \
     -e "XPACK_SECURITY_ENABLED=true" \
-    "$KIBANA_IMAGE" >/dev/null
+    "$image" >/dev/null
 
   echo "$container"
 }
@@ -115,4 +123,23 @@ stop_sandbox() {
   local es_container="$1" kb_container="$2"
   log "Removing containers: $es_container, $kb_container"
   docker rm -f "$es_container" "$kb_container" 2>/dev/null || true
+}
+
+# ── Warm images ──────────────────────────────────────────────────────────────
+
+KIBANA_WARM_TAG="kibana-sandbox:warm"
+
+has_warm_kibana_image() {
+  docker image inspect "$KIBANA_WARM_TAG" &>/dev/null
+}
+
+build_warm_kibana_image() {
+  log "Building warm Kibana image (encryption keys pre-baked)..."
+  docker build -t "$KIBANA_WARM_TAG" - >/dev/null <<EOF
+FROM ${KIBANA_IMAGE}
+RUN echo 'xpack.encryptedSavedObjects.encryptionKey: "${KIBANA_ENCRYPTION_KEY}"' >> /usr/share/kibana/config/kibana.yml && \
+    echo 'xpack.security.encryptionKey: "${KIBANA_ENCRYPTION_KEY}"' >> /usr/share/kibana/config/kibana.yml && \
+    echo 'xpack.reporting.encryptionKey: "${KIBANA_ENCRYPTION_KEY}"' >> /usr/share/kibana/config/kibana.yml
+EOF
+  log "Warm Kibana image built: $KIBANA_WARM_TAG"
 }

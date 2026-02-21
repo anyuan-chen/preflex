@@ -19,6 +19,14 @@ load_config() {
   [[ -f "$conf" ]] || die "Config file not found: $conf"
   # shellcheck source=sandbox.conf
   source "$conf"
+
+  # Load secrets from .env if present (API keys, etc.)
+  local env_file="${SCRIPT_DIR}/.env"
+  if [[ -f "$env_file" ]]; then
+    set -a
+    source "$env_file"
+    set +a
+  fi
 }
 
 # ── ID generation ───────────────────────────────────────────────────────────
@@ -53,36 +61,42 @@ kb_curl() {
     "$@"
 }
 
+kb_curl_internal() {
+  # Like kb_curl but adds x-elastic-internal-origin header for /internal/ APIs
+  local port="$1" method="$2" path="$3"
+  shift 3
+  curl -s -X "$method" \
+    -u "elastic:${ELASTIC_PASSWORD}" \
+    -H "Content-Type: application/json" \
+    -H "kbn-xsrf: true" \
+    -H "x-elastic-internal-origin: kibana" \
+    "http://localhost:${port}${path}" \
+    "$@"
+}
+
 # ── Port allocation ────────────────────────────────────────────────────────
 
+port_in_use() {
+  # Check if a port is actually bound on the host
+  lsof -iTCP:"$1" -sTCP:LISTEN &>/dev/null
+}
+
 find_available_ports() {
-  local used_es_ports=() used_kb_ports=() used_mcp_ports=()
-
-  # Scan existing manifests for used ports
-  if [[ -d "$SANDBOXES_DIR" ]]; then
-    for manifest in "$SANDBOXES_DIR"/*/manifest.json; do
-      [[ -f "$manifest" ]] || continue
-      used_es_ports+=("$(jq -r '.es_port' "$manifest")")
-      used_kb_ports+=("$(jq -r '.kibana_port' "$manifest")")
-      used_mcp_ports+=("$(jq -r '.mcp_port // empty' "$manifest")")
-    done
-  fi
-
-  # Find next available ES port
+  # Find next available ES port (skip ports in use on host)
   local es_port="$ES_PORT_BASE"
-  while printf '%s\n' "${used_es_ports[@]}" 2>/dev/null | grep -qx "$es_port"; do
+  while port_in_use "$es_port"; do
     ((es_port++))
   done
 
   # Find next available Kibana port
   local kb_port="$KIBANA_PORT_BASE"
-  while printf '%s\n' "${used_kb_ports[@]}" 2>/dev/null | grep -qx "$kb_port"; do
+  while port_in_use "$kb_port"; do
     ((kb_port++))
   done
 
   # Find next available MCP port
   local mcp_port="$MCP_PORT_BASE"
-  while printf '%s\n' "${used_mcp_ports[@]}" 2>/dev/null | grep -qx "$mcp_port"; do
+  while port_in_use "$mcp_port"; do
     ((mcp_port++))
   done
 

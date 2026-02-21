@@ -113,6 +113,7 @@ run_scenario_workload() {
     over-sharded)   workload_over_sharded "$port" "$id" ;;
     slow-queries)   workload_slow_queries "$port" "$id" ;;
     bad-replicas)   workload_bad_replicas "$port" "$id" ;;
+    clees-keys)     workload_clees_keys "$port" "$id" ;;
     *)              die "Unknown scenario workload: $scenario" ;;
   esac
 }

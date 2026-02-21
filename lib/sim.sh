@@ -37,7 +37,7 @@ _sim_fire() {
     "http://localhost:${_SIM_PORT}${path}" \
     -d "$body" 2>/dev/null &
 
-  ((_SIM_QUERY_COUNT++))
+  ((_SIM_QUERY_COUNT++)) || true
 }
 
 # ── Sleep with jitter ───────────────────────────────────────────────────────

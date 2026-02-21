@@ -1,6 +1,21 @@
 #!/usr/bin/env bash
 # es.sh — ES operations: create index, bulk load, settings, license
 
+# ── Wait for security realm ──────────────────────────────────────────────────
+
+wait_for_es_auth() {
+  local port="$1" max_wait="${2:-30}"
+  local elapsed=0
+  while (( elapsed < max_wait )); do
+    if es_curl "$port" GET "/_security/_authenticate" 2>/dev/null | jq -e '.username' &>/dev/null; then
+      return 0
+    fi
+    sleep 2
+    ((elapsed += 2))
+  done
+  die "ES security realm not ready after ${max_wait}s"
+}
+
 # ── License ─────────────────────────────────────────────────────────────────
 
 activate_trial() {
@@ -42,10 +57,15 @@ create_index() {
 bulk_load() {
   # Usage: bulk_load <port> <ndjson-data>
   # Data should be newline-delimited JSON (action + doc pairs)
+  # Note: We use curl directly instead of es_curl because es_curl
+  # sets Content-Type: application/json which conflicts with _bulk's
+  # required Content-Type: application/x-ndjson.
   local port="$1" data="$2"
   local resp
-  resp=$(es_curl "$port" POST "/_bulk" \
+  resp=$(curl -s -X POST \
+    -u "elastic:${ELASTIC_PASSWORD}" \
     -H "Content-Type: application/x-ndjson" \
+    "http://localhost:${port}/_bulk" \
     -d "$data")
   local errors
   errors=$(echo "$resp" | jq -r '.errors')
