@@ -27,10 +27,10 @@ source "${SCRIPT_DIR}/lib/sim.sh"
 load_config
 
 # All available scenarios
-ALL_SCENARIOS=("bad-mapping" "over-sharded" "slow-queries" "bad-replicas")
+ALL_SCENARIOS=("bad-mapping" "over-sharded" "slow-queries" "bad-replicas" "clees-keys")
 
 # All available evals (realtime simulations)
-ALL_EVALS=("bad-mapping" "over-sharded" "slow-queries" "bad-replicas" "mixed-degradation")
+ALL_EVALS=("bad-mapping" "over-sharded" "slow-queries" "bad-replicas" "clees-keys" "mixed-degradation")
 
 # ── Scenario dispatch ───────────────────────────────────────────────────────
 
@@ -45,6 +45,7 @@ run_scenario_setup() {
     over-sharded)   setup_over_sharded "$port" "$id" ;;
     slow-queries)   setup_slow_queries "$port" "$id" ;;
     bad-replicas)   setup_bad_replicas "$port" "$id" ;;
+    clees-keys)     setup_clees_keys "$port" "$id" ;;
     *)              die "Unknown scenario: $scenario" ;;
   esac
 }
@@ -60,6 +61,7 @@ run_scenario_data() {
     over-sharded)   load_over_sharded_data "$port" "$id" ;;
     slow-queries)   load_slow_queries_data "$port" "$id" ;;
     bad-replicas)   load_bad_replicas_data "$port" "$id" ;;
+    clees-keys)     load_clees_keys_data "$port" "$id" ;;
     *)              die "Unknown scenario: $scenario" ;;
   esac
 }
@@ -128,44 +130,90 @@ cmd_create() {
   # 3. Ensure Docker network exists
   ensure_network
 
+  # ── Start MCP build in background (no ES/Kibana dependency) ──
+  ensure_mcp_built &
+  local mcp_build_pid=$!
+
   # 4. Start ES container, wait for ready
   local es_container
   es_container=$(start_es "$id" "$es_port")
   wait_for_es "$es_port"
 
-  # 5. Activate trial license + set kibana_system password
+  # 5. Wait for security realm, then activate trial + set kibana_system password
+  wait_for_es_auth "$es_port"
   activate_trial "$es_port"
   set_kibana_password "$es_port"
 
-  # 6. Start Kibana container
+  # ── Wait for MCP build (started during ES boot, should be done by now) ──
+  if ! wait "$mcp_build_pid"; then
+    die "MCP server build failed"
+  fi
+
+  # ── ES is ready + MCP built — launch three parallel phases ──
+
+  # Phase A: Kibana start + wait (+ encryption keys if no warm image)
   local kb_container
   kb_container=$(start_kibana "$id" "$kb_port" "$es_container")
+  (
+    if has_warm_kibana_image; then
+      wait_for_kibana "$kb_port"
+    else
+      sleep 5
+      write_kibana_encryption_keys "$kb_container"
+      wait_for_kibana "$kb_port"
+    fi
+  ) &
+  local kibana_pid=$!
 
-  # 7. Write encryption keys to kibana.yml, then wait for Kibana
-  #    (need to wait briefly for container to start before writing)
-  sleep 5
-  write_kibana_encryption_keys "$kb_container"
-  wait_for_kibana "$kb_port"
+  # Phase B: Scenario setup + data loading
+  (
+    for scenario in "${scenarios[@]}"; do
+      log "═══ Running scenario: $scenario ═══"
+      run_scenario_setup "$scenario" "$es_port" "$id"
+      run_scenario_data "$scenario" "$es_port" "$id"
+    done
+  ) &
+  local scenarios_pid=$!
 
-  # 8. Run each scenario's setup + data
+  # Phase C: Start MCP server + wait
+  (
+    log "Starting MCP server on port $mcp_port"
+    local pid
+    pid=$(start_mcp_server "$id" "$es_port" "$mcp_port" "auto" "$kb_port")
+    manifest_update "$id" --argjson mcp_pid "$pid" '.mcp_pid = $mcp_pid'
+    wait_for_mcp "$mcp_port" || warn "MCP server may not be ready"
+  ) &
+  local mcp_start_pid=$!
+
+  # ── Wait for all three phases ──
+  local phase_failed=false
+
+  if ! wait "$kibana_pid" 2>/dev/null; then
+    warn "Kibana setup phase failed"
+    phase_failed=true
+  fi
+
+  if ! wait "$scenarios_pid" 2>/dev/null; then
+    warn "Scenario loading phase failed"
+    phase_failed=true
+  fi
+
+  if ! wait "$mcp_start_pid" 2>/dev/null; then
+    warn "MCP server phase failed"
+    phase_failed=true
+  fi
+
+  if $phase_failed; then
+    die "One or more parallel phases failed — check logs above"
+  fi
+
+  # Merge golden answers into manifest (safe to do sequentially after scenarios)
   for scenario in "${scenarios[@]}"; do
-    log "═══ Running scenario: $scenario ═══"
-    run_scenario_setup "$scenario" "$es_port" "$id"
-    run_scenario_data "$scenario" "$es_port" "$id"
-
-    # Merge golden answers into manifest
     local golden_file="${SCRIPT_DIR}/scenarios/${scenario}/golden.json"
     manifest_merge_golden "$id" "$golden_file"
   done
 
-  # 9. Start MCP server
-  log "Starting MCP server on port $mcp_port"
-  local mcp_pid
-  mcp_pid=$(start_mcp_server "$id" "$es_port" "$mcp_port")
-  manifest_update "$id" --argjson mcp_pid "$mcp_pid" '.mcp_pid = $mcp_pid'
-  wait_for_mcp "$mcp_port" || warn "MCP server may not be ready"
-
-  # 10. Set up Agent Builder (tools + agent + MCP connector)
+  # 10. Set up Agent Builder (needs Kibana + MCP ready)
   setup_sandbox_agent "$id" "$kb_port" "$es_port" "$mcp_port" "${scenarios[@]}"
 
   # 11. Print summary
@@ -494,8 +542,187 @@ cmd_simulate() {
     over-sharded)       eval_over_sharded "$es_port" "$id" ;;
     slow-queries)       eval_slow_queries "$es_port" "$id" ;;
     bad-replicas)       eval_bad_replicas "$es_port" "$id" ;;
+    clees-keys)         eval_clees_keys "$es_port" "$id" ;;
     mixed-degradation)  eval_mixed_degradation "$es_port" "$id" ;;
   esac
+}
+
+# ── Logs ───────────────────────────────────────────────────────────────────
+
+cmd_logs() {
+  local id="" conv_id="" raw=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --conversation=*) conv_id="${1#--conversation=}" ;;
+      --raw)            raw=true ;;
+      *)
+        if [[ -z "$id" ]]; then
+          id="$1"
+        else
+          die "Unknown option: $1"
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  [[ -n "$id" ]] || die "Usage: sandbox logs <id> [--conversation=<id>] [--raw]"
+
+  local manifest_file
+  manifest_file="$(manifest_path "$id")"
+  [[ -f "$manifest_file" ]] || die "Sandbox $id not found"
+
+  local kb_port
+  kb_port=$(manifest_get "$id" '.kibana_port')
+
+  local sandbox_dir
+  sandbox_dir="$(manifest_dir "$id")"
+
+  if [[ -z "$conv_id" ]]; then
+    # List conversations
+    local conversations
+    conversations=$(kb_curl "$kb_port" GET "/api/agent_builder/conversations")
+
+    local count
+    count=$(echo "$conversations" | jq '.results | length')
+
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  AGENT CONVERSATIONS — Sandbox $id ($count total)"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    echo "$conversations" | jq -r '
+      [.results[] | {id, created_at, title}] | sort_by(.created_at) | reverse[] |
+      "  \(.created_at)  \(.id[0:8])  \(.title[0:60])"'
+
+    echo ""
+    echo "  View details: ./sandbox logs $id --conversation=<id>"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    return 0
+  fi
+
+  # Resolve short IDs — match prefix
+  local full_id
+  full_id=$(kb_curl "$kb_port" GET "/api/agent_builder/conversations" | \
+    jq -r --arg prefix "$conv_id" '.results[] | select(.id | startswith($prefix)) | .id' | head -1)
+
+  if [[ -z "$full_id" ]]; then
+    die "No conversation found matching: $conv_id"
+  fi
+
+  local conversation
+  conversation=$(kb_curl "$kb_port" GET "/api/agent_builder/conversations/${full_id}")
+
+  if $raw; then
+    echo "$conversation" | jq .
+    return 0
+  fi
+
+  # Pretty-print the conversation
+  local title created rounds
+  title=$(echo "$conversation" | jq -r '.title')
+  created=$(echo "$conversation" | jq -r '.created_at')
+  rounds=$(echo "$conversation" | jq '.rounds | length')
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  $title"
+  echo "  $created  |  $rounds rounds  |  $full_id"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  # Extract and display each round
+  echo "$conversation" | jq -r '
+    .rounds[] | .steps[] |
+    if .type == "user_message" then
+      "\n  ┌─ USER ─────────────────────────────────────────────\n  │ \(.content // .message // "(empty)")\n  └────────────────────────────────────────────────────"
+    elif .type == "tool_call" then
+      "\n  ▶ TOOL: \(.tool_id)" +
+      "\n    params: \(.params | tojson | if length > 200 then .[:200] + "..." else . end)" +
+      (if .results[0].type == "error" then
+        "\n    ✗ ERROR: \(.results[0].data.message // .results[0].data | tojson)"
+      else
+        "\n    ✓ OK" +
+        (.results[0].data.content[0].text // (.results[0].data | tojson) |
+          if length > 200 then "  \(.[:200])..." else "  \(.)" end |
+          "\n    result: \(.)")
+      end)
+    elif .type == "assistant_message" then
+      "\n  ┌─ AGENT ────────────────────────────────────────────\n  │ \(.content // .message // "(empty)" | .[0:500])\n  └────────────────────────────────────────────────────"
+    else
+      "\n  [step type=\(.type)]"
+    end
+  ' 2>/dev/null || echo "$conversation" | jq -r '
+    .rounds[] | .steps[] |
+    "  [\(.type)] \(.tool_id // "")\(.content // .message // "" | .[0:100])"
+  '
+
+  # Summary: tool call stats
+  echo ""
+  echo "  ── Tool Call Summary ──────────────────────────────────"
+  echo "$conversation" | jq -r '
+    [.rounds[].steps[] | select(.type == "tool_call")] |
+    group_by(.results[0].type) |
+    map({
+      status: (if .[0].results[0].type == "error" then "FAILED" else "OK" end),
+      tools: [.[].tool_id]
+    }) |
+    .[] | "    \(.status): \(.tools | join(", "))"
+  '
+
+  # Save full log to sandbox dir
+  local log_file="${sandbox_dir}/conversation-${full_id}.json"
+  echo "$conversation" | jq . > "$log_file"
+  echo ""
+  echo "  Full log saved: $log_file"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+# ── Warmup ──────────────────────────────────────────────────────────────────
+
+cmd_warmup() {
+  log "Warming up: pulling images, building MCP server, baking warm Kibana image"
+
+  # Pull ES + Kibana images in parallel
+  log "Pulling Docker images..."
+  docker pull "$ES_IMAGE" &
+  local es_pull_pid=$!
+  docker pull "$KIBANA_IMAGE" &
+  local kb_pull_pid=$!
+
+  # Build MCP server in parallel with image pulls
+  ensure_mcp_built &
+  local mcp_build_pid=$!
+
+  # Wait for all pulls + build
+  local failed=false
+  if ! wait "$es_pull_pid"; then
+    warn "Failed to pull ES image: $ES_IMAGE"
+    failed=true
+  fi
+  if ! wait "$kb_pull_pid"; then
+    warn "Failed to pull Kibana image: $KIBANA_IMAGE"
+    failed=true
+  fi
+  if ! wait "$mcp_build_pid"; then
+    warn "MCP server build failed"
+    failed=true
+  fi
+  $failed && die "Warmup failed — check errors above"
+
+  # Build warm Kibana image (needs base image pulled first)
+  build_warm_kibana_image
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  Warmup complete"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  ES image:      $ES_IMAGE"
+  echo "  Kibana image:  $KIBANA_WARM_TAG (warm)"
+  echo "  MCP server:    built + cached"
+  echo ""
+  echo "  Run './sandbox create' — Kibana will skip encryption key restart."
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
 # ── Usage ───────────────────────────────────────────────────────────────────
@@ -510,22 +737,28 @@ Commands:
   destroy --all                                  Destroy all sandboxes
   list                                           List all sandboxes
   reset <id>                                     Destroy + recreate a sandbox
+  warmup                                         Pull images + build warm Kibana image
   workload <id>                                  Run batch workloads (quick check)
   simulate <id> [--eval=name]                    Run realtime phased simulation
   diagnose <id>                                  Collect cluster diagnostic snapshot
   eval <id> --diagnosis=<file.json>              Score agent output against golden
+  logs <id>                                      List agent conversations
+  logs <id> --conversation=<id>                  Show conversation tool calls + results
+  logs <id> --conversation=<id> --raw            Dump full conversation JSON
 
 Available scenarios:
   bad-mapping     Indices with wrong field types
   over-sharded    Index with too many shards for its data
   slow-queries    Low slow-log thresholds + expensive query patterns
   bad-replicas    Replica misconfiguration (too many / too few)
+  clees-keys      Clees Keys app: SQL anti-patterns across 4 indices
 
 Available simulations (--eval):
   bad-mapping         Analysts build dashboards on bad types
   over-sharded        Traffic ramp exposes shard fan-out overhead
   slow-queries        Bad deploy + report job floods expensive queries
   bad-replicas        Load ramp on misconfigured replicas
+  clees-keys          Search + analytics deploy with SQL anti-patterns
   mixed-degradation   All problems compound simultaneously (default for multi-scenario)
 
 Eval workflow:
@@ -558,10 +791,12 @@ case "$command" in
   destroy)  cmd_destroy "$@" ;;
   list)     cmd_list ;;
   reset)    cmd_reset "$@" ;;
+  warmup)   cmd_warmup ;;
   workload)  cmd_workload "$@" ;;
   simulate)  cmd_simulate "$@" ;;
   diagnose)  cmd_diagnose "$@" ;;
   eval)      cmd_eval "$@" ;;
+  logs)      cmd_logs "$@" ;;
   help|-h|--help) usage ;;
   "")       usage; exit 1 ;;
   *)        die "Unknown command: $command. Run './sandbox help' for usage." ;;
