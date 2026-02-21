@@ -354,6 +354,77 @@ else
   ((SKIP+=4))
 fi
 
+# ── Test 5: Status Endpoint + Monitor ─────────────────────────────────────────
+
+echo ""
+echo "── Test 5: Status Endpoint + Monitor ──"
+
+STATUS=$(curl -sf "http://127.0.0.1:${MCP_PORT}/status" 2>&1 || echo '{}')
+
+assert_json_field "status returns server name" "$STATUS" '.server'
+assert_json_field "status returns esUrl" "$STATUS" '.esUrl'
+assert_json_field "status returns verifyMode" "$STATUS" '.verifyMode'
+assert_json_field "status returns monitor section" "$STATUS" '.monitor'
+
+# Check monitor is enabled
+MONITOR_ENABLED=$(echo "$STATUS" | jq -r '.monitor.enabled // false')
+if [[ "$MONITOR_ENABLED" == "true" ]]; then
+  green "  ✓ Monitor is enabled"
+  ((PASS++))
+
+  # Wait for monitor to produce at least one window (needs 3 polls @ 10s = 30s)
+  # If monitor interval is shorter or we've been running long enough, check for events
+  WINDOW_COUNT=$(echo "$STATUS" | jq '.monitor.windowsBuffered // 0')
+  if [[ "$WINDOW_COUNT" -gt 0 ]]; then
+    green "  ✓ Monitor has buffered $WINDOW_COUNT windows"
+    ((PASS++))
+  else
+    # Poll status for up to 45s waiting for at least one window
+    echo "  ... waiting for monitor to produce windows (up to 45s)"
+    local_elapsed=0
+    while [[ "$local_elapsed" -lt 45 ]]; do
+      sleep 5
+      ((local_elapsed+=5))
+      STATUS=$(curl -sf "http://127.0.0.1:${MCP_PORT}/status" 2>&1 || echo '{}')
+      WINDOW_COUNT=$(echo "$STATUS" | jq '.monitor.windowsBuffered // 0')
+      if [[ "$WINDOW_COUNT" -gt 0 ]]; then
+        break
+      fi
+    done
+    if [[ "$WINDOW_COUNT" -gt 0 ]]; then
+      green "  ✓ Monitor produced $WINDOW_COUNT windows (after ${local_elapsed}s)"
+      ((PASS++))
+    else
+      yellow "  ⊘ Monitor has not produced windows yet (may need more time)"
+      ((SKIP++))
+    fi
+  fi
+
+  # Check baseline window count is incrementing
+  BASELINE_WINDOWS=$(echo "$STATUS" | jq '.monitor.baselineWindows // 0')
+  if [[ "$BASELINE_WINDOWS" -gt 0 ]]; then
+    green "  ✓ Baseline has absorbed $BASELINE_WINDOWS windows"
+    ((PASS++))
+  else
+    yellow "  ⊘ Baseline has not absorbed windows yet"
+    ((SKIP++))
+  fi
+
+  # Check activeLocks is an array (even if empty)
+  assert_json_field "activeLocks is present" "$STATUS" '.monitor.activeLocks'
+
+  # Check recentEvents is an array
+  assert_json_field "recentEvents is present" "$STATUS" '.monitor.recentEvents'
+
+  # Check invocation history structure
+  assert_json_field "invocationHistory is present" "$STATUS" '.monitor.invocationHistory'
+  assert_json_field "invocationHistory has total" "$STATUS" '.monitor.invocationHistory.total >= 0'
+
+else
+  yellow "  ⊘ Monitor is disabled — skipping monitor tests"
+  ((SKIP+=7))
+fi
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""

@@ -1,0 +1,26 @@
+{
+  "name": "preflex-bot",
+  "version": "1.0.0",
+  "description": "Preflex PR reviewer — catches Postgres queries that belong in Elasticsearch",
+  "type": "module",
+  "main": "dist/review.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/webhook.js",
+    "review": "node dist/review.js",
+    "fix": "node dist/fix-agent.js",
+    "setup-indices": "node dist/scripts/setup-es-indices.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.42",
+    "@octokit/auth-app": "^7.2.2",
+    "@octokit/rest": "^21.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^4.0.18"
+  }
+}

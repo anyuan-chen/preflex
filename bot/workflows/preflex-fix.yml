@@ -1,0 +1,95 @@
+name: Preflex Fix
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to fix"
+        required: true
+        type: number
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+
+    services:
+      elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0
+        ports:
+          - 9200:9200
+        env:
+          discovery.type: single-node
+          xpack.security.enabled: "false"
+          ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+        options: >-
+          --health-cmd "curl -sf http://localhost:9200/_cluster/health"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout PR repo
+        uses: actions/checkout@v4
+
+      - name: Checkout Preflex
+        uses: actions/checkout@v4
+        with:
+          repository: anyuan-chen/preflex
+          path: preflex
+          sparse-checkout: |
+            bot
+            mcp-server
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install & build MCP server
+        working-directory: preflex/mcp-server
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install & build bot
+        working-directory: preflex/bot
+        run: |
+          npm ci
+          npm run build
+
+      - name: Setup ES indices
+        working-directory: preflex/bot
+        env:
+          ES_URL: http://localhost:9200
+        run: node dist/scripts/setup-es-indices.js
+
+      - name: Start MCP server
+        working-directory: preflex/mcp-server
+        env:
+          ES_URL: http://localhost:9200
+          ES_USER: ""
+          ES_PASSWORD: ""
+          MCP_PORT: "3100"
+          VERIFY_MODE: auto
+          MONITOR_ENABLED: "false"
+        run: |
+          node dist/index.js &
+          sleep 3
+          curl -sf http://127.0.0.1:3100/mcp -X POST \
+            -H "Content-Type: application/json" \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci","version":"1.0"}}}'
+
+      - name: Run Preflex Fix Agent
+        working-directory: preflex/bot
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          MCP_BASE_URL: http://127.0.0.1:3100
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+        run: node dist/fix-agent.js

@@ -3,6 +3,9 @@ sandboxes/*/
 mcp-server/.build-hash
 mcp-server/dist/
 mcp-server/node_modules/
+bot/dist/
+bot/node_modules/
+bot/*.html
 .env
 
 # Non-project artifacts
