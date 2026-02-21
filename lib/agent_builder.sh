@@ -19,30 +19,24 @@ enable_agent_builder() {
 # ── Connectors ──────────────────────────────────────────────────────────────
 
 setup_connector() {
-  # Creates an OpenAI-compatible connector for Gemini
-  # Requires GEMINI_API_KEY env var
+  # Creates an OpenAI-compatible connector for a local Ollama model
   local kb_port="$1"
-  local api_key="${GEMINI_API_KEY:-}"
+  local ollama_url="${OLLAMA_URL:-http://host.docker.internal:11434}"
+  local ollama_model="${OLLAMA_MODEL:-qwen3:4b}"
 
-  if [[ -z "$api_key" ]]; then
-    warn "GEMINI_API_KEY not set — skipping connector creation"
-    echo ""
-    return 0
-  fi
-
-  log "Creating Gemini connector via OpenAI-compatible endpoint"
+  log "Creating Ollama connector (${ollama_model} @ ${ollama_url})"
   local resp
   resp=$(kb_curl "$kb_port" POST "/api/actions/connector" \
     -d "{
       \"connector_type_id\": \".gen-ai\",
-      \"name\": \"Gemini (sandbox)\",
+      \"name\": \"Ollama (${ollama_model})\",
       \"config\": {
-        \"apiUrl\": \"https://generativelanguage.googleapis.com/v1beta/openai/chat/completions\",
+        \"apiUrl\": \"${ollama_url}/v1/chat/completions\",
         \"apiProvider\": \"Other\",
-        \"defaultModel\": \"gemini-2.0-flash\"
+        \"defaultModel\": \"${ollama_model}\"
       },
       \"secrets\": {
-        \"apiKey\": \"${api_key}\"
+        \"apiKey\": \"ollama\"
       }
     }")
 
@@ -151,8 +145,7 @@ create_mcp_connector() {
         connector_type_id: ".mcp",
         name: "ES Optimizer MCP",
         config: {
-          url: $url,
-          headers: ""
+          serverUrl: $url
         },
         secrets: {}
       }')")
@@ -169,25 +162,78 @@ create_mcp_connector() {
 }
 
 import_mcp_tools() {
-  local kb_port="$1" mcp_connector_id="$2"
+  local kb_port="$1" mcp_connector_id="$2" namespace="${3:-preflex}"
 
-  # List available tools from the MCP server
-  log "Importing tools from MCP connector $mcp_connector_id"
-  local resp
-  resp=$(kb_curl "$kb_port" POST "/api/actions/connector/${mcp_connector_id}/_execute" \
-    -d '{
-      "params": {
-        "subAction": "listTools"
-      }
-    }')
+  # 1. List available tools from MCP server
+  log "Listing tools from MCP connector $mcp_connector_id"
+  local list_resp
+  list_resp=$(kb_curl_internal "$kb_port" GET \
+    "/internal/agent_builder/tools/_list_mcp_tools?connectorId=${mcp_connector_id}")
+
+  # Handle both .tools[] and .mcpTools[] response formats
+  local tool_names
+  tool_names=$(echo "$list_resp" | jq -r '(.mcpTools // .tools // [])[]?.name // empty' 2>/dev/null)
+  if [[ -z "$tool_names" ]]; then
+    warn "No tools returned from MCP connector: $list_resp"
+    return 1
+  fi
 
   local tool_count
-  tool_count=$(echo "$resp" | jq '.data.tools | length // 0')
-  if [[ "$tool_count" -gt 0 ]]; then
-    log "MCP server exposes $tool_count tools"
-  else
-    warn "No tools returned from MCP connector: $resp"
+  tool_count=$(echo "$tool_names" | wc -l | tr -d ' ')
+  log "MCP server exposes $tool_count tools"
+
+  # 2. Build the tools array for bulk import
+  local tools_json
+  tools_json=$(echo "$list_resp" | jq '[(.mcpTools // .tools // [])[] | {name: .name, description: .description}]')
+
+  # 3. Bulk import via internal API — Kibana often doesn't create all tools
+  #    in a single call, so retry until (created + skipped) == total.
+  log "Bulk importing $tool_count MCP tools with namespace '$namespace'"
+  local payload_file
+  payload_file=$(mktemp)
+  echo "$tools_json" > "${payload_file}.tools"
+  jq -n \
+    --arg cid "$mcp_connector_id" \
+    --arg ns "$namespace" \
+    --slurpfile tools "${payload_file}.tools" \
+    '{connector_id: $cid, namespace: $ns, tools: $tools[0]}' > "$payload_file"
+  rm -f "${payload_file}.tools"
+
+  local attempts=0 max_attempts=6 total_imported=0
+  while (( attempts < max_attempts )); do
+    ((attempts++))
+    local resp
+    resp=$(kb_curl_internal "$kb_port" POST "/internal/agent_builder/tools/_bulk_create_mcp" \
+      -d @"$payload_file")
+
+    local created skipped
+    created=$(echo "$resp" | jq '.summary.created // 0' 2>/dev/null)
+    skipped=$(echo "$resp" | jq '.summary.skipped // 0' 2>/dev/null)
+
+    if [[ "$created" -gt 0 ]]; then
+      log "Bulk import pass $attempts: created $created, skipped $skipped"
+    fi
+
+    total_imported=$(( created + skipped ))
+    if (( total_imported >= tool_count )); then
+      log "All $tool_count MCP tools imported (namespace: $namespace)"
+      break
+    fi
+
+    if (( attempts < max_attempts )); then
+      log "Bulk import incomplete ($total_imported/$tool_count) — retrying in 2s..."
+      sleep 2
+    fi
+  done
+
+  if (( total_imported < tool_count )); then
+    warn "Only $total_imported/$tool_count tools imported after $max_attempts attempts"
   fi
+
+  rm -f "$payload_file"
+
+  # Return the list of tool names that were exposed (for dynamic tool ID construction)
+  echo "$tool_names"
 }
 
 # ── Full agent setup for a sandbox ──────────────────────────────────────────
@@ -206,12 +252,14 @@ setup_sandbox_agent() {
 
   # 3. Create MCP connector (points to host MCP server)
   local mcp_connector_id=""
+  local mcp_namespace="preflex"
+  local mcp_tool_names=""
   if [[ -n "$mcp_port" ]]; then
     local mcp_url
     mcp_url=$(get_mcp_url_for_kibana "$mcp_port")
     mcp_connector_id=$(create_mcp_connector "$kb_port" "$mcp_url")
     if [[ -n "$mcp_connector_id" ]]; then
-      import_mcp_tools "$kb_port" "$mcp_connector_id"
+      mcp_tool_names=$(import_mcp_tools "$kb_port" "$mcp_connector_id" "$mcp_namespace")
     fi
   fi
 
@@ -231,7 +279,7 @@ setup_sandbox_agent() {
     "FROM .es_index_stats | STATS total_docs = SUM(doc_count), total_shards = COUNT(*) BY index_name | SORT total_docs DESC | LIMIT 50" \
     '{}'
 
-  # 7. Collect all tool IDs (custom + built-in + MCP)
+  # 7. Collect all tool IDs (custom + built-in + dynamically imported MCP tools)
   local tool_ids=(
     "optimizer.index_search"
     "optimizer.cluster_diag"
@@ -241,46 +289,26 @@ setup_sandbox_agent() {
     "platform.core.generate_esql"
   )
 
-  # Add MCP tools if connector was created
-  if [[ -n "$mcp_connector_id" ]]; then
-    tool_ids+=("mcp.${mcp_connector_id}.cluster_health")
-    tool_ids+=("mcp.${mcp_connector_id}.index_info")
-    tool_ids+=("mcp.${mcp_connector_id}.shard_info")
-    tool_ids+=("mcp.${mcp_connector_id}.node_stats")
-    tool_ids+=("mcp.${mcp_connector_id}.index_mapping")
-    tool_ids+=("mcp.${mcp_connector_id}.field_caps")
-    tool_ids+=("mcp.${mcp_connector_id}.index_settings")
-    tool_ids+=("mcp.${mcp_connector_id}.index_stats")
-    tool_ids+=("mcp.${mcp_connector_id}.allocation_explain")
-    tool_ids+=("mcp.${mcp_connector_id}.query_profile")
-    tool_ids+=("mcp.${mcp_connector_id}.running_tasks")
-    tool_ids+=("mcp.${mcp_connector_id}.update_settings")
-    tool_ids+=("mcp.${mcp_connector_id}.reindex")
-    tool_ids+=("mcp.${mcp_connector_id}.shrink_index")
-    tool_ids+=("mcp.${mcp_connector_id}.manage_aliases")
-    tool_ids+=("mcp.${mcp_connector_id}.cancel_task")
-    tool_ids+=("mcp.${mcp_connector_id}.confirm_operation")
-    tool_ids+=("mcp.${mcp_connector_id}.cancel_operation")
-    tool_ids+=("mcp.${mcp_connector_id}.list_pending_operations")
+  # Add MCP tools dynamically from what import_mcp_tools reported
+  if [[ -n "$mcp_tool_names" ]]; then
+    while IFS= read -r name; do
+      [[ -n "$name" ]] && tool_ids+=("${mcp_namespace}.${name}")
+    done <<< "$mcp_tool_names"
+    log "Added ${#tool_ids[@]} total tool IDs (including $(echo "$mcp_tool_names" | wc -l | tr -d ' ') MCP tools)"
   fi
 
   # 8. Create the optimizer agent
   local system_prompt
-  system_prompt="You are an Elasticsearch cluster optimizer. Your job is to diagnose performance and configuration problems in this Elasticsearch cluster and recommend specific fixes.
+  system_prompt="You are an Elasticsearch cluster optimizer. Diagnose performance and configuration problems, then fix them.
 
-For each issue you find, provide:
-1. What the problem is (with evidence from the cluster)
-2. Why it matters (performance impact, risk)
-3. The exact API call or configuration change to fix it
+For each issue: (1) evidence from the cluster, (2) why it matters, (3) the exact fix.
 
-You have access to MCP tools that let you directly inspect and modify the cluster. Use them to:
-- Diagnose: cluster_health, index_info, shard_info, index_mapping, index_settings, index_stats, field_caps, node_stats, allocation_explain, query_profile
-- Fix: update_settings, reindex, shrink_index, manage_aliases
+Use tools to inspect AND modify the cluster:
+- Diagnose: cluster_health, index_mapping, field_caps, node_stats, index_stats, shard_info, index_info
+- Fix: reindex (copy data with correct mappings), update_settings, shrink_index, manage_aliases
 
-Focus areas: mapping types, shard counts, replica configuration, query performance, index settings.
-
-Indices in this sandbox are prefixed with 'sb-${id}-'. Examine all of them.
-Always start by checking cluster_health and index_info to understand the cluster state."
+When you find bad mappings, USE reindex to create a fixed copy, then manage_aliases to swap.
+Indices in this sandbox are prefixed with 'sb-${id}-'."
 
   create_agent "$kb_port" \
     "optimizer" \
