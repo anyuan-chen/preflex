@@ -1,2 +1,13 @@
 sandboxes/*/
 !sandboxes/.gitkeep
+mcp-server/.build-hash
+mcp-server/dist/
+mcp-server/node_modules/
+.env
+
+# Non-project artifacts
+assets/
+.playwright-mcp/
+clees-keys/
+SUBMISSION.md
+sim-verbose.sh
